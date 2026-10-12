@@ -4,8 +4,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+# ffmpeg for audio; tesseract (eng + spa) and poppler for free document OCR
+# (/v1/extract, 2026-10-12). No paid AI reads a document.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

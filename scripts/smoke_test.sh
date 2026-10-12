@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Smoke test a running Reece Speech API with a real audio file.
+# Smoke test a running Reece Speech API with a real audio file — or a document
+# (pdf / png / jpg): a document goes to /v1/extract instead of /v1/transcribe.
 # Usage: ./scripts/smoke_test.sh https://<domain> <SPEECH_API_KEY> path/to/call.mp3
+#        ./scripts/smoke_test.sh https://<domain> <SPEECH_API_KEY> path/to/invoice.pdf
 set -euo pipefail
 
 if [ $# -ne 3 ]; then
@@ -15,6 +17,21 @@ FILE="$3"
 echo "== 1. Health check"
 curl -sS "$BASE/health"
 echo
+
+case "${FILE,,}" in
+  *.pdf|*.png|*.jpg|*.jpeg|*.tif|*.tiff|*.heic)
+    echo "== 2. Extract document text (waits for the result)"
+    code=$(curl -sS -o /tmp/speech_smoke.json -w '%{http_code}' \
+      -H "Authorization: Bearer $KEY" \
+      -F "file=@$FILE" \
+      "$BASE/v1/extract")
+    echo "HTTP $code"
+    python3 -c 'import json,sys; d=json.load(open("/tmp/speech_smoke.json")); print({k: d[k] for k in ("page_count","ocr_pages","engine","seconds") if k in d}); print((d.get("text") or d.get("detail") or "")[:600])' 2>/dev/null || cat /tmp/speech_smoke.json
+    rm -f /tmp/speech_smoke.json
+    [ "$code" = "200" ]
+    exit $?
+    ;;
+esac
 
 echo "== 2. Transcribe (waits for the result)"
 code=$(curl -sS -o /tmp/speech_smoke.json -w '%{http_code}' \
