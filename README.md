@@ -1,10 +1,13 @@
 # Reece Speech API
 
-A private service that turns audio into text, with timestamps. Any Reece app (Five9 calls,
-sales recordings, Omi, meetings, audiobooks, voice notes) can send it audio and get words back.
+A private service that turns audio **and documents** into text. Any Reece app (Five9 calls,
+sales recordings, Omi, meetings, audiobooks, voice notes) can send it audio and get words back
+with timestamps; LP-MCP sends it marketing invoices (PDF / scans / photos) and gets the text back.
 
 - **No paid AI.** Speech-to-text runs on [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-  (`small` model, `int8`, CPU) inside our own container. Railway compute is the only cost.
+  (`small` model, `int8`, CPU) inside our own container. Document text comes from the PDF's own
+  text layer (pdfplumber) and, for scanned pages and photos, from Tesseract OCR — free, local,
+  not an AI model. Railway compute is the only cost.
 - **Audio is never stored.** Files live in a temp folder only while being transcribed, then are
   deleted — after success and after failure.
 - **Speech only.** No summaries or CRM extraction here; that will be a separate service.
@@ -80,6 +83,41 @@ With the default memory store, jobs are forgotten when the service restarts and 
 are dropped after 24 hours. Jobs that were running during a restart are marked `failed` with
 "Service restarted — please resubmit".
 
+### Documents — `POST /v1/extract` (2026-10-12)
+
+Turns a PDF, PNG, JPEG, TIFF or HEIC into text, for free. The file type is judged by its
+content, never its name. Each PDF page is read from its text layer; a page with fewer than
+`EXTRACT_MIN_TEXT_CHARS` (40) readable characters is treated as a scan, rendered at `OCR_DPI`
+(300) and read by **Tesseract** (`OCR_LANGS`, default `eng+spa`, `--psm 6`). Images are OCR'd
+directly. Tables pdfplumber finds come back per page, since invoice line items are usually tables.
+OCR is Tesseract — free, local, and not an AI model; nothing here sends the document anywhere.
+
+```
+curl -H "Authorization: Bearer <SPEECH_API_KEY>" -F "file=@invoice.pdf" https://<domain>/v1/extract
+```
+
+Send exactly one of `file` (multipart) or `file_url`. Response:
+
+```json
+{
+  "text": "…all pages joined…",
+  "pages": [{"page": 1, "method": "text", "chars": 812, "text": "…", "tables": [[["Description","Amount"],["Leads","$1,500.00"]]]}],
+  "page_count": 1,
+  "ocr_pages": 0,
+  "engine": "pdfplumber+tesseract-5.3.4",
+  "seconds": 0.4
+}
+```
+
+`method` is `text` (text layer) or `ocr`. Limits: `EXTRACT_MAX_PAGES` (40) → 413; the same
+`MAX_UPLOAD_MB` as audio → 413; an unsupported type → 415. Same key, same rate limit, same
+single-worker lock as transcription (OCR never runs at the same time as a call), and the file is
+deleted after processing, success or failure. Logs carry counts only, never the text.
+
+Long documents: `POST /v1/jobs` with `kind=extract` and the same `file` / `file_url` fields
+returns `{job_id, status:"queued", chunks_total:1}`; poll `GET /v1/jobs/{job_id}` until `done`,
+and `result` has the `/v1/extract` shape.
+
 ### Errors
 
 | code | why |
@@ -106,6 +144,10 @@ are dropped after 24 hours. Jobs that were running during a restart are marked `
 Logs show one line per request/job: id, audio length, seconds taken, model. Never audio or text.
 
 ## Settings (environment variables)
+
+Document extraction: `EXTRACT_MAX_PAGES` (40), `OCR_LANGS` (`eng+spa`), `OCR_DPI` (300),
+`EXTRACT_MIN_TEXT_CHARS` (40). The Dockerfile installs `tesseract-ocr`, `tesseract-ocr-eng`,
+`tesseract-ocr-spa` and `poppler-utils`.
 
 See `.env.example`. Only `SPEECH_API_KEY` is required.
 

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from . import audio
 from .audio import Chunk
 from .store import JobStore, now_iso
+from . import extract as extract_mod
 
 log = logging.getLogger("speech.jobs")
 
@@ -73,6 +74,13 @@ class JobItem:
     plan: list[Chunk]
     language: str
     timestamps: bool
+    kind: str = "transcribe"  # 'transcribe' | 'extract' (a document, 2026-10-12)
+    extract_settings: "extract_mod.ExtractSettings | None" = None
+
+
+# A job's `model` field says which engine ran it; extract jobs carry this prefix so
+# job_view can return the document shape without a schema change in the job store.
+EXTRACT_MODEL_PREFIX = "extract:"
 
 
 class JobManager:
@@ -110,6 +118,8 @@ class JobManager:
                 log.exception("job %s crashed outside the normal error path", item.job_id)
 
     def process(self, item: JobItem) -> None:
+        if item.kind == "extract":
+            return self.process_extract(item)
         started = time.monotonic()
         duration = None
         outcome = "failed"
@@ -153,6 +163,39 @@ class JobManager:
             log.info("job id=%s status=%s duration=%s chunks=%d seconds=%.1f model=%s",
                      item.job_id, outcome, f"{duration:.1f}" if duration is not None else "?",
                      len(item.plan), time.monotonic() - started, self.model_name)
+
+    def process_extract(self, item: JobItem) -> None:
+        """A document job: one 'chunk', the extract result stored as text + pages (in `segments`)."""
+        started = time.monotonic()
+        outcome = "failed"
+        pages = 0
+        try:
+            self.store.update_job(item.job_id, status="processing")
+            self.store.update_chunk(item.job_id, 0, status="processing", attempts=1)
+            settings = item.extract_settings or extract_mod.ExtractSettings()
+            result = extract_mod.extract_document(item.source_path, settings)
+            pages = result["page_count"]
+            self.store.update_chunk(item.job_id, 0, status="done", error=None, text=result["text"], segments=[])
+            self.store.update_job(
+                item.job_id,
+                status="done",
+                text=result["text"],
+                language=None,
+                segments=result["pages"],
+                duration_seconds=result["seconds"],
+                model=f"{EXTRACT_MODEL_PREFIX}{result['engine']}",
+                completed_at=now_iso(),
+            )
+            outcome = "done"
+        except extract_mod.ExtractError as exc:
+            self._fail(item.job_id, exc.message)
+        except Exception as exc:  # noqa: BLE001
+            self._fail(item.job_id, f"extraction failed: {type(exc).__name__}: {exc}")
+        finally:
+            shutil.rmtree(item.workdir, ignore_errors=True)
+            # Never log document text.
+            log.info("job id=%s kind=extract status=%s pages=%d seconds=%.1f",
+                     item.job_id, outcome, pages, time.monotonic() - started)
 
     def _fail(self, job_id: str, message: str) -> None:
         try:

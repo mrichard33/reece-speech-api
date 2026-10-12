@@ -14,9 +14,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from . import audio
+from . import extract as extract_mod
 from .auth import extract_bearer, is_authorized
 from .config import Settings, load_settings
-from .jobs import RESTART_MESSAGE, JobItem, JobManager, transcribe_plan
+from .jobs import EXTRACT_MODEL_PREFIX, RESTART_MESSAGE, JobItem, JobManager, transcribe_plan
 from .ratelimit import RateLimiter
 from .store import JobStore, MemoryStore, StoreError, build_store, now_iso
 from .transcriber import Transcriber, is_valid_language
@@ -92,12 +93,12 @@ def create_app(settings: Settings | None = None, transcriber=None, store: JobSto
         }
         return JSONResponse(body, status_code=200 if loaded else 503)
 
-    async def fetch_audio(workdir: str, upload: UploadFile | None, audio_url: str | None) -> tuple[str, str]:
-        """Put exactly one of upload / audio_url on disk. Returns (path, source_name)."""
+    async def fetch_source(workdir: str, upload: UploadFile | None, audio_url: str | None, what: str = "audio") -> tuple[str, str]:
+        """Put exactly one of upload / url on disk. Returns (path, source_name)."""
         has_upload = upload is not None and bool(upload.filename)
         has_url = bool(audio_url and audio_url.strip())
         if has_upload == has_url:
-            raise HTTPException(400, "Send exactly one of: audio (file) or audio_url")
+            raise HTTPException(400, f"Send exactly one of: {what} (file) or {what}_url")
         path = os.path.join(workdir, "source")  # no extension: the format is judged by content
         if has_upload:
             await audio.save_upload(upload, path, settings.max_upload_bytes)
@@ -108,6 +109,15 @@ def create_app(settings: Settings | None = None, transcriber=None, store: JobSto
             # Path basename only — a query string can carry a signed-URL token.
             name = os.path.basename(urlparse(url).path) or "audio_url"
         return path, name[:SOURCE_NAME_MAX]
+
+    async def fetch_audio(workdir: str, upload: UploadFile | None, audio_url: str | None) -> tuple[str, str]:
+        return await fetch_source(workdir, upload, audio_url, "audio")
+
+    def extract_settings() -> extract_mod.ExtractSettings:
+        return extract_mod.ExtractSettings(
+            max_pages=settings.extract_max_pages, ocr_langs=settings.ocr_langs,
+            ocr_dpi=settings.ocr_dpi, min_text_chars=settings.extract_min_text_chars,
+        )
 
     def check_language(language: str) -> str:
         language = (language or "auto").strip().lower()
@@ -166,20 +176,64 @@ def create_app(settings: Settings | None = None, transcriber=None, store: JobSto
                      request_id, status, f"{duration:.1f}" if duration is not None else "?",
                      time.monotonic() - started, settings.whisper_model)
 
+    @app.post("/v1/extract")
+    async def extract_document(
+        request: Request,
+        file: UploadFile | None = File(None),
+        file_url: str | None = Form(None),
+    ):
+        """Free text extraction for a PDF / image (2026-10-12). Text layer first, Tesseract
+        OCR for scanned pages. Same key, same rate limit, same size cap, same single-worker
+        lock as transcription; the file is deleted on success and on failure."""
+        request_id = str(uuid.uuid4())
+        started = time.monotonic()
+        workdir = tempfile.mkdtemp(prefix="speech-extract-")
+        status = 500
+        pages = 0
+        ocr_pages = 0
+        try:
+            src, _ = await fetch_source(workdir, file, file_url, "file")
+            result = await run_in_threadpool(extract_mod.extract_document, src, extract_settings())
+            pages, ocr_pages = result["page_count"], result["ocr_pages"]
+            status = 200
+            return result
+        except extract_mod.ExtractError as exc:
+            status = exc.status_code
+            raise HTTPException(exc.status_code, exc.message) from exc
+        except audio.AudioError as exc:
+            status = exc.status_code
+            raise HTTPException(exc.status_code, exc.message) from exc
+        except HTTPException as exc:
+            status = exc.status_code
+            raise
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+            # Never log document text — counts only.
+            log.info("extract id=%s status=%d pages=%d ocr_pages=%d seconds=%.1f",
+                     request_id, status, pages, ocr_pages, time.monotonic() - started)
+
     @app.post("/v1/jobs", status_code=202)
     async def create_job(
         request: Request,
         audio_file: UploadFile | None = File(None, alias="audio"),
         audio_url: str | None = Form(None),
+        file: UploadFile | None = File(None),
+        file_url: str | None = Form(None),
         language: str = Form("auto"),
         timestamps: bool = Form(True),
+        kind: str = Form("transcribe"),
     ):
+        kind = (kind or "transcribe").strip().lower()
+        if kind not in ("transcribe", "extract"):
+            raise HTTPException(400, "kind must be 'transcribe' or 'extract'")
+        if kind == "extract":
+            return await create_extract_job(request, file or audio_file, file_url or audio_url)
         language = check_language(language)
         job_id = str(uuid.uuid4())
         workdir = tempfile.mkdtemp(prefix=f"speech-job-{job_id[:8]}-")
         handed_off = False
         try:
-            src, source_name = await fetch_audio(workdir, audio_file, audio_url)
+            src, source_name = await fetch_audio(workdir, audio_file or file, audio_url or file_url)
             info = await run_in_threadpool(audio.probe, src)
             duration, normalized = info.duration, False
             if duration is None:
@@ -218,6 +272,40 @@ def create_app(settings: Settings | None = None, transcriber=None, store: JobSto
             if not handed_off:
                 shutil.rmtree(workdir, ignore_errors=True)
 
+    async def create_extract_job(request: Request, upload: UploadFile | None, url: str | None):
+        """An async document extraction (for > 10-page PDFs). One chunk; polled like any job."""
+        job_id = str(uuid.uuid4())
+        workdir = tempfile.mkdtemp(prefix=f"speech-extract-{job_id[:8]}-")
+        handed_off = False
+        try:
+            src, source_name = await fetch_source(workdir, upload, url, "file")
+            if extract_mod.sniff_kind(src) is None:
+                raise HTTPException(extract_mod.UNSUPPORTED.status_code, extract_mod.UNSUPPORTED.message)
+            job = {
+                "id": job_id, "status": "queued", "source_name": source_name,
+                "duration_seconds": None, "model": f"{EXTRACT_MODEL_PREFIX}pdfplumber+tesseract",
+                "chunks_total": 1, "chunks_done": 0,
+                "created_at": now_iso(), "updated_at": now_iso(),
+            }
+            chunks = [{"chunk_index": 0, "start_seconds": 0.0, "end_seconds": 0.0, "status": "queued", "attempts": 0}]
+            try:
+                await run_in_threadpool(request.app.state.store.create_job, job, chunks)
+            except StoreError as exc:
+                log.error("job id=%s could not be stored: %s", job_id, exc)
+                raise HTTPException(503, "Job store unavailable — try again shortly") from exc
+            request.app.state.jobs.enqueue(JobItem(
+                job_id=job_id, workdir=workdir, source_path=src, normalized=False,
+                plan=[], language="auto", timestamps=False, kind="extract", extract_settings=extract_settings(),
+            ))
+            handed_off = True
+            log.info("job id=%s kind=extract status=queued", job_id)
+            return {"job_id": job_id, "status": "queued", "chunks_total": 1}
+        except audio.AudioError as exc:
+            raise HTTPException(exc.status_code, exc.message) from exc
+        finally:
+            if not handed_off:
+                shutil.rmtree(workdir, ignore_errors=True)
+
     @app.get("/v1/jobs/{job_id}")
     async def get_job(job_id: str, request: Request):
         try:
@@ -239,7 +327,18 @@ def create_app(settings: Settings | None = None, transcriber=None, store: JobSto
 def job_view(job: dict) -> dict:
     """The public shape of a job (the API contract), from the stored row."""
     result = None
-    if job["status"] == "done":
+    model = str(job.get("model") or "")
+    if job["status"] == "done" and model.startswith(EXTRACT_MODEL_PREFIX):
+        pages = job.get("segments") or []
+        result = {
+            "text": job.get("text") or "",
+            "pages": pages,
+            "page_count": len(pages),
+            "ocr_pages": sum(1 for p in pages if isinstance(p, dict) and p.get("method") == "ocr"),
+            "engine": model[len(EXTRACT_MODEL_PREFIX):],
+            "seconds": float(job["duration_seconds"]) if job.get("duration_seconds") is not None else None,
+        }
+    elif job["status"] == "done":
         result = {
             "text": job.get("text") or "",
             "language": job.get("language"),

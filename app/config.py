@@ -28,6 +28,11 @@ class Settings:
     job_store: str = "memory"
     supabase_url: str = ""
     supabase_service_key: str = ""
+    # Document extraction (/v1/extract, 2026-10-12): free pdfplumber + Tesseract.
+    extract_max_pages: int = 40
+    ocr_langs: str = "eng+spa"
+    ocr_dpi: int = 300
+    extract_min_text_chars: int = 40
 
     @property
     def max_upload_bytes(self) -> int:
@@ -86,4 +91,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         job_store=job_store,
         supabase_url=supabase_url,
         supabase_service_key=supabase_key,
+        extract_max_pages=_number(env, "EXTRACT_MAX_PAGES", 40, int, 1),
+        ocr_langs=_get(env, "OCR_LANGS", "eng+spa"),
+        ocr_dpi=_number(env, "OCR_DPI", 300, int, 72),
+        extract_min_text_chars=_number(env, "EXTRACT_MIN_TEXT_CHARS", 40, int, 0),
     )

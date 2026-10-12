@@ -15,8 +15,8 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements-dev.txt
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install ffmpeg and tesseract (the OCR tests run for real)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa poppler-utils
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
       # The Whisper model is mocked in tests — nothing is downloaded here.
